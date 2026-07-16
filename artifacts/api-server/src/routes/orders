@@ -1,0 +1,301 @@
+import { Router } from "express";
+import { eq, and, desc } from "drizzle-orm";
+import { db, ordersTable, documentsTable, shopsTable, queueItemsTable } from "@workspace/db";
+import {
+  CreateOrderBody,
+  CreateOrderResponse,
+  GetOrderParams,
+  GetOrderResponse,
+  UpdateOrderStatusParams,
+  UpdateOrderStatusBody,
+  UpdateOrderStatusResponse,
+  GetOrderQrParams,
+  GetOrderQrResponse,
+  ListOrdersQueryParams,
+  ListOrdersResponse,
+} from "@workspace/api-zod";
+import { randomBytes } from "crypto";
+
+const router = Router();
+
+function calcPrice(pages: number, copies: number, printType: string, doubleSided: boolean, lamination: boolean, binding: string, isUrgent: boolean): number {
+  const perPage = printType === "color" ? 5 : 1.5; // INR
+  const paperCost = pages * copies * 0.5;
+  const inkCost = pages * copies * perPage;
+  const laminationCost = lamination ? copies * 15 : 0;
+  const bindingCost = binding === "none" ? 0 : binding === "staple" ? 5 : binding === "spiral" ? 40 : 120;
+  const urgentSurcharge = isUrgent ? (paperCost + inkCost) * 0.2 : 0;
+  const subtotal = paperCost + inkCost + laminationCost + bindingCost + urgentSurcharge;
+  const gst = subtotal * 0.18;
+  return Math.round((subtotal + gst) * 100) / 100;
+}
+
+/** GET /orders */
+router.get("/orders", async (req, res): Promise<void> => {
+  const params = ListOrdersQueryParams.safeParse(req.query);
+  if (!params.success) {
+    res.status(400).json({ error: params.error.message });
+    return;
+  }
+
+  const { status, shopId, limit = 20, offset = 0 } = params.data;
+
+  let query = db.select({
+    order: ordersTable,
+    shopName: shopsTable.name,
+  })
+    .from(ordersTable)
+    .leftJoin(shopsTable, eq(ordersTable.shopId, shopsTable.id))
+    .orderBy(desc(ordersTable.createdAt))
+    .limit(limit)
+    .offset(offset);
+
+  const orders = await query;
+
+  const filtered = orders.filter(row => {
+    if (status && row.order.status !== status) return false;
+    if (shopId && row.order.shopId !== shopId) return false;
+    return true;
+  });
+
+  const responseData = ListOrdersResponse.parse({
+    orders: filtered.map(row => ({
+      id: row.order.id,
+      anonymousId: row.order.anonymousId,
+      documentId: row.order.documentId,
+      shopId: row.order.shopId,
+      shopName: row.shopName,
+      copies: row.order.copies,
+      printType: row.order.printType,
+      paperSize: row.order.paperSize,
+      doubleSided: row.order.doubleSided,
+      lamination: row.order.lamination,
+      binding: row.order.binding,
+      isUrgent: row.order.isUrgent,
+      pageCount: row.order.pageCount,
+      totalAmount: row.order.totalAmount,
+      status: row.order.status,
+      expiresAt: row.order.expiresAt,
+      completedAt: row.order.completedAt,
+      createdAt: row.order.createdAt,
+    })),
+    total: filtered.length,
+  });
+  res.json(responseData);
+});
+
+/** POST /orders */
+router.post("/orders", async (req, res): Promise<void> => {
+  const parsed = CreateOrderBody.safeParse(req.body);
+  if (!parsed.success) {
+    res.status(400).json({ error: parsed.error.message });
+    return;
+  }
+
+  const { documentId, shopId, copies, printType, paperSize, doubleSided, lamination, binding, isUrgent, specialInstructions } = parsed.data;
+
+  // Get page count from document
+  const docs = await db.select().from(documentsTable).where(eq(documentsTable.id, documentId)).limit(1);
+  const pageCount = docs[0]?.pageCount ?? 1;
+
+  const totalAmount = calcPrice(pageCount, copies, printType ?? "bw", doubleSided ?? false, lamination ?? false, binding ?? "none", isUrgent ?? false);
+  const qrToken = randomBytes(16).toString("hex");
+  const expiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000);
+
+  const [order] = await db.insert(ordersTable).values({
+    documentId,
+    shopId,
+    copies,
+    printType: (printType as "bw" | "color") ?? "bw",
+    paperSize: (paperSize as "A4" | "A3" | "Letter" | "Legal") ?? "A4",
+    doubleSided: doubleSided ?? false,
+    lamination: lamination ?? false,
+    binding: (binding as "none" | "staple" | "spiral" | "hard") ?? "none",
+    isUrgent: isUrgent ?? false,
+    pageCount,
+    totalAmount,
+    status: "pending",
+    specialInstructions,
+    qrToken,
+    expiresAt,
+  }).returning();
+
+  // Add to queue
+  await db.insert(queueItemsTable).values({
+    orderId: order.id,
+    shopId,
+    anonymousId: order.anonymousId,
+    printType: order.printType,
+    pageCount,
+    copies,
+    totalAmount,
+    status: "queued",
+    expiresAt,
+  });
+
+  // Update shop total orders
+  await db.update(shopsTable).set({
+    totalOrders: (await db.select({ count: shopsTable.totalOrders }).from(shopsTable).where(eq(shopsTable.id, shopId)).limit(1))[0]?.count ?? 0 + 1,
+  }).where(eq(shopsTable.id, shopId));
+
+  const shop = await db.select().from(shopsTable).where(eq(shopsTable.id, shopId)).limit(1);
+
+  const responseData = CreateOrderResponse.parse({
+    id: order.id,
+    anonymousId: order.anonymousId,
+    documentId: order.documentId,
+    shopId: order.shopId,
+    shopName: shop[0]?.name ?? null,
+    copies: order.copies,
+    printType: order.printType,
+    paperSize: order.paperSize,
+    doubleSided: order.doubleSided,
+    lamination: order.lamination,
+    binding: order.binding,
+    isUrgent: order.isUrgent,
+    pageCount: order.pageCount,
+    totalAmount: order.totalAmount,
+    status: order.status,
+    expiresAt: order.expiresAt,
+    completedAt: order.completedAt,
+    createdAt: order.createdAt,
+  });
+  res.status(201).json(responseData);
+});
+
+/** GET /orders/:id */
+router.get("/orders/:id", async (req, res): Promise<void> => {
+  const rawId = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
+  const params = GetOrderParams.safeParse({ id: rawId });
+  if (!params.success) {
+    res.status(400).json({ error: params.error.message });
+    return;
+  }
+
+  const results = await db.select({
+    order: ordersTable,
+    shopName: shopsTable.name,
+  })
+    .from(ordersTable)
+    .leftJoin(shopsTable, eq(ordersTable.shopId, shopsTable.id))
+    .where(eq(ordersTable.id, params.data.id))
+    .limit(1);
+
+  if (!results.length) {
+    res.status(404).json({ error: "Order not found" });
+    return;
+  }
+
+  const { order, shopName } = results[0];
+  const responseData = GetOrderResponse.parse({
+    id: order.id,
+    anonymousId: order.anonymousId,
+    documentId: order.documentId,
+    shopId: order.shopId,
+    shopName,
+    copies: order.copies,
+    printType: order.printType,
+    paperSize: order.paperSize,
+    doubleSided: order.doubleSided,
+    lamination: order.lamination,
+    binding: order.binding,
+    isUrgent: order.isUrgent,
+    pageCount: order.pageCount,
+    totalAmount: order.totalAmount,
+    status: order.status,
+    expiresAt: order.expiresAt,
+    completedAt: order.completedAt,
+    createdAt: order.createdAt,
+  });
+  res.json(responseData);
+});
+
+/** PATCH /orders/:id/status */
+router.patch("/orders/:id/status", async (req, res): Promise<void> => {
+  const rawId = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
+  const params = UpdateOrderStatusParams.safeParse({ id: rawId });
+  const body = UpdateOrderStatusBody.safeParse(req.body);
+  if (!params.success || !body.success) {
+    res.status(400).json({ error: "Invalid request" });
+    return;
+  }
+
+  const completedAt = body.data.status === "completed" ? new Date() : undefined;
+
+  const [updated] = await db.update(ordersTable).set({
+    status: body.data.status as "accepted" | "printing" | "completed" | "cancelled",
+    ...(completedAt ? { completedAt } : {}),
+    updatedAt: new Date(),
+  }).where(eq(ordersTable.id, params.data.id)).returning();
+
+  if (!updated) {
+    res.status(404).json({ error: "Order not found" });
+    return;
+  }
+
+  // If completed, trigger document deletion
+  if (body.data.status === "completed") {
+    await db.update(documentsTable).set({
+      status: "printed",
+    }).where(eq(documentsTable.id, updated.documentId));
+
+    // Update queue item
+    await db.update(queueItemsTable).set({ status: "printed" }).where(eq(queueItemsTable.orderId, params.data.id));
+  }
+
+  const shop = await db.select().from(shopsTable).where(eq(shopsTable.id, updated.shopId)).limit(1);
+
+  const responseData = UpdateOrderStatusResponse.parse({
+    id: updated.id,
+    anonymousId: updated.anonymousId,
+    documentId: updated.documentId,
+    shopId: updated.shopId,
+    shopName: shop[0]?.name ?? null,
+    copies: updated.copies,
+    printType: updated.printType,
+    paperSize: updated.paperSize,
+    doubleSided: updated.doubleSided,
+    lamination: updated.lamination,
+    binding: updated.binding,
+    isUrgent: updated.isUrgent,
+    pageCount: updated.pageCount,
+    totalAmount: updated.totalAmount,
+    status: updated.status,
+    expiresAt: updated.expiresAt,
+    completedAt: updated.completedAt,
+    createdAt: updated.createdAt,
+  });
+  res.json(responseData);
+});
+
+/** GET /orders/:id/qr */
+router.get("/orders/:id/qr", async (req, res): Promise<void> => {
+  const rawId = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
+  const params = GetOrderQrParams.safeParse({ id: rawId });
+  if (!params.success) {
+    res.status(400).json({ error: params.error.message });
+    return;
+  }
+
+  const orders = await db.select().from(ordersTable).where(eq(ordersTable.id, params.data.id)).limit(1);
+  if (!orders.length) {
+    res.status(404).json({ error: "Order not found" });
+    return;
+  }
+
+  const order = orders[0];
+  const qrData = JSON.stringify({
+    orderId: order.id,
+    token: order.qrToken,
+    shopId: order.shopId,
+    expiresAt: order.expiresAt?.toISOString(),
+  });
+
+  const responseData = GetOrderQrResponse.parse({
+    qrData,
+    expiresAt: order.expiresAt ?? new Date(Date.now() + 24 * 60 * 60 * 1000),
+  });
+  res.json(responseData);
+});
+
+export default router;
