@@ -1,0 +1,163 @@
+import { Router } from "express";
+import { eq, desc } from "drizzle-orm";
+import { db, subscriptionPlansTable, subscriptionsTable } from "@workspace/db";
+import {
+  ListPlansResponse,
+  CreateSubscriptionBody,
+  CreateSubscriptionResponse,
+  GetCurrentSubscriptionResponse,
+} from "@workspace/api-zod";
+
+const router = Router();
+
+async function seedPlansIfEmpty() {
+  const existing = await db.select().from(subscriptionPlansTable).limit(1);
+  if (existing.length > 0) return;
+
+  const plans = [
+    {
+      name: "Free",
+      price: 0,
+      billingCycle: "monthly" as const,
+      features: JSON.stringify(["5 orders/month", "1GB storage", "Basic support", "Standard QR codes"]),
+      maxOrders: 5,
+      storageGb: 1,
+      aiAssistant: false,
+      prioritySupport: false,
+      isPopular: false,
+    },
+    {
+      name: "Basic",
+      price: 499,
+      billingCycle: "monthly" as const,
+      features: JSON.stringify(["100 orders/month", "5GB storage", "Email support", "Secure QR codes", "Order analytics"]),
+      maxOrders: 100,
+      storageGb: 5,
+      aiAssistant: false,
+      prioritySupport: false,
+      isPopular: false,
+    },
+    {
+      name: "Professional",
+      price: 1499,
+      billingCycle: "monthly" as const,
+      features: JSON.stringify(["Unlimited orders", "20GB storage", "Priority support", "AI Assistant", "Advanced analytics", "Custom branding", "API access"]),
+      maxOrders: null,
+      storageGb: 20,
+      aiAssistant: true,
+      prioritySupport: true,
+      isPopular: true,
+    },
+    {
+      name: "Enterprise",
+      price: 4999,
+      billingCycle: "monthly" as const,
+      features: JSON.stringify(["Unlimited orders", "100GB storage", "24/7 dedicated support", "AI Assistant", "White-label option", "Custom integrations", "SLA guarantee", "Team accounts"]),
+      maxOrders: null,
+      storageGb: 100,
+      aiAssistant: true,
+      prioritySupport: true,
+      isPopular: false,
+    },
+  ];
+
+  for (const plan of plans) {
+    await db.insert(subscriptionPlansTable).values(plan);
+  }
+}
+
+/** GET /subscriptions/plans */
+router.get("/subscriptions/plans", async (req, res): Promise<void> => {
+  await seedPlansIfEmpty();
+
+  const plans = await db.select().from(subscriptionPlansTable).orderBy(subscriptionPlansTable.price);
+
+  const responseData = ListPlansResponse.parse(plans.map(p => ({
+    id: p.id,
+    name: p.name,
+    price: p.price,
+    billingCycle: p.billingCycle,
+    features: JSON.parse(p.features),
+    maxOrders: p.maxOrders,
+    storageGb: p.storageGb,
+    aiAssistant: p.aiAssistant,
+    prioritySupport: p.prioritySupport,
+    isPopular: p.isPopular,
+  })));
+  res.json(responseData);
+});
+
+/** POST /subscriptions */
+router.post("/subscriptions", async (req, res): Promise<void> => {
+  const parsed = CreateSubscriptionBody.safeParse(req.body);
+  if (!parsed.success) {
+    res.status(400).json({ error: parsed.error.message });
+    return;
+  }
+
+  const plan = await db.select().from(subscriptionPlansTable).where(eq(subscriptionPlansTable.id, parsed.data.planId)).limit(1);
+  if (!plan.length) {
+    res.status(404).json({ error: "Plan not found" });
+    return;
+  }
+
+  const billingCycle = (parsed.data.billingCycle ?? "monthly") as "monthly" | "yearly";
+  const daysToAdd = billingCycle === "yearly" ? 365 : 30;
+  const currentPeriodEnd = new Date(Date.now() + daysToAdd * 24 * 60 * 60 * 1000);
+
+  const [sub] = await db.insert(subscriptionsTable).values({
+    shopId: "demo-shop",
+    planId: parsed.data.planId,
+    status: "active",
+    billingCycle,
+    currentPeriodEnd,
+  }).returning();
+
+  const responseData = CreateSubscriptionResponse.parse({
+    id: sub.id,
+    planId: sub.planId,
+    planName: plan[0].name,
+    status: sub.status,
+    currentPeriodEnd: sub.currentPeriodEnd,
+    createdAt: sub.createdAt,
+  });
+  res.status(201).json(responseData);
+});
+
+/** GET /subscriptions */
+router.get("/subscriptions", async (req, res): Promise<void> => {
+  const subs = await db.select({
+    sub: subscriptionsTable,
+    planName: subscriptionPlansTable.name,
+  })
+    .from(subscriptionsTable)
+    .leftJoin(subscriptionPlansTable, eq(subscriptionsTable.planId, subscriptionPlansTable.id))
+    .orderBy(desc(subscriptionsTable.createdAt))
+    .limit(1);
+
+  if (!subs.length) {
+    // Return a free trial subscription if none exists
+    res.json({
+      id: "trial",
+      planId: "free",
+      planName: "Free Trial",
+      status: "trial",
+      currentPeriodEnd: new Date(Date.now() + 14 * 24 * 60 * 60 * 1000).toISOString(),
+      createdAt: new Date().toISOString(),
+    });
+    return;
+  }
+
+  const { sub, planName } = subs[0];
+  const responseData = GetCurrentSubscriptionResponse.parse({
+    id: sub.id,
+    planId: sub.planId,
+    planName: planName ?? "Unknown",
+    status: sub.status,
+    currentPeriodEnd: sub.currentPeriodEnd,
+    createdAt: sub.createdAt,
+  });
+  res.json(responseData);
+});
+
+export default router;
