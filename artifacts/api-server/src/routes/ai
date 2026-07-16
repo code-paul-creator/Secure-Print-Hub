@@ -1,0 +1,151 @@
+import { Router } from "express";
+import { eq } from "drizzle-orm";
+import { db, documentsTable } from "@workspace/db";
+import {
+  AiChatBody,
+  AiChatResponse,
+  AnalyzeDocumentBody,
+  AnalyzeDocumentResponse,
+  EstimatePrintPriceBody,
+  EstimatePrintPriceResponse,
+} from "@workspace/api-zod";
+
+const router = Router();
+
+const AI_RESPONSES: Record<string, string> = {
+  price: "Based on your document specifications, I estimate the total cost. A standard A4 black & white print costs ₹2 per page, while color printing costs ₹10 per page. Lamination adds ₹15 per sheet. GST at 18% is applied to the subtotal.",
+  sensitive: "I've analyzed your document. Documents containing personal identifiers like Aadhaar, PAN, or passport numbers are classified as highly sensitive. I recommend enabling password protection and using our secure QR delivery.",
+  paper: "For passport-size photos, use A4 paper (210×297mm). For certificates and official documents, A4 is standard in India. For architectural drawings or large posters, consider A3.",
+  default: "I'm SecurePrint AI, your intelligent print assistant. I can help you estimate print costs, analyze document sensitivity, suggest optimal print settings, and guide you through our secure printing process. What would you like to know?",
+  greeting: "Welcome to SecurePrint AI! I'm here to help you print your documents safely and securely. Every file is encrypted with AES-256 and automatically deleted after printing. How can I assist you today?",
+  security: "SecurePrint AI uses military-grade AES-256 encryption for all documents. Your files are encrypted the moment they're uploaded, stored in our secure servers with no admin access, and cryptographically destroyed after printing. We generate signed, one-time-use URLs for print shop access — your document is never directly downloaded.",
+};
+
+function getAiResponse(message: string): { reply: string; suggestions: string[] } {
+  const lower = message.toLowerCase();
+  let reply = AI_RESPONSES.default;
+
+  if (lower.includes("price") || lower.includes("cost") || lower.includes("estimate")) {
+    reply = AI_RESPONSES.price;
+  } else if (lower.includes("sensitive") || lower.includes("aadhaar") || lower.includes("pan") || lower.includes("passport")) {
+    reply = AI_RESPONSES.sensitive;
+  } else if (lower.includes("paper") || lower.includes("size") || lower.includes("a4") || lower.includes("a3")) {
+    reply = AI_RESPONSES.paper;
+  } else if (lower.includes("hello") || lower.includes("hi") || lower.includes("hey")) {
+    reply = AI_RESPONSES.greeting;
+  } else if (lower.includes("secure") || lower.includes("encrypt") || lower.includes("safe") || lower.includes("privacy")) {
+    reply = AI_RESPONSES.security;
+  }
+
+  const suggestions = [
+    "Estimate price for 20 pages color printing",
+    "Is my document sensitive?",
+    "What paper size should I use?",
+    "How does the secure QR code work?",
+  ];
+
+  return { reply, suggestions };
+}
+
+/** POST /ai/chat */
+router.post("/ai/chat", async (req, res): Promise<void> => {
+  const parsed = AiChatBody.safeParse(req.body);
+  if (!parsed.success) {
+    res.status(400).json({ error: parsed.error.message });
+    return;
+  }
+
+  const { reply, suggestions } = getAiResponse(parsed.data.message);
+
+  const responseData = AiChatResponse.parse({
+    reply,
+    suggestions,
+    timestamp: new Date(),
+  });
+  res.json(responseData);
+});
+
+/** POST /ai/analyze */
+router.post("/ai/analyze", async (req, res): Promise<void> => {
+  const parsed = AnalyzeDocumentBody.safeParse(req.body);
+  if (!parsed.success) {
+    res.status(400).json({ error: parsed.error.message });
+    return;
+  }
+
+  const docs = await db.select().from(documentsTable).where(eq(documentsTable.id, parsed.data.documentId)).limit(1);
+  if (!docs.length) {
+    res.status(404).json({ error: "Document not found" });
+    return;
+  }
+
+  const doc = docs[0];
+  const pageCount = doc.pageCount ?? 1;
+  const detectedType = (doc.detectedType ?? "general") as "passport" | "pan" | "aadhaar" | "invoice" | "resume" | "legal" | "medical" | "general" | "unknown";
+  const isSensitive = doc.isSensitive;
+
+  const warnings: string[] = [];
+  if (isSensitive) {
+    warnings.push(`This document appears to contain sensitive personal information (${detectedType.toUpperCase()}). Consider enabling password protection.`);
+    warnings.push("We recommend using watermark preview mode for added security.");
+  }
+
+  const colorPages = Math.floor(pageCount * 0.3);
+
+  const responseData = AnalyzeDocumentResponse.parse({
+    documentId: doc.id,
+    detectedType,
+    isSensitive,
+    pageCount,
+    orientation: "portrait",
+    hasBlankPages: false,
+    colorPages,
+    suggestedSettings: {
+      paperSize: "A4",
+      printType: colorPages > pageCount * 0.5 ? "color" : "bw",
+      doubleSided: pageCount > 2,
+      compress: doc.fileSize > 5 * 1024 * 1024,
+      removeBlankPages: false,
+    },
+    warnings,
+  });
+  res.json(responseData);
+});
+
+/** POST /ai/estimate-price */
+router.post("/ai/estimate-price", async (req, res): Promise<void> => {
+  const parsed = EstimatePrintPriceBody.safeParse(req.body);
+  if (!parsed.success) {
+    res.status(400).json({ error: parsed.error.message });
+    return;
+  }
+
+  const { pages, copies, printType, doubleSided, lamination, binding, isUrgent } = parsed.data;
+
+  const perPage = printType === "color" ? 10 : 1.5;
+  const paperCost = pages * copies * 0.5;
+  const inkCost = pages * copies * perPage * (doubleSided ? 1.8 : 1);
+  const laminationCost = lamination ? copies * 15 : 0;
+  const bindingCost = binding === "none" ? 0 : binding === "staple" ? 5 : binding === "spiral" ? 40 : 120;
+  const urgentSurcharge = isUrgent ? (paperCost + inkCost) * 0.2 : 0;
+  const subtotal = paperCost + inkCost + laminationCost + bindingCost + urgentSurcharge;
+  const gst = Math.round(subtotal * 0.18 * 100) / 100;
+  const total = Math.round((subtotal + gst) * 100) / 100;
+
+  const responseData = EstimatePrintPriceResponse.parse({
+    totalAmount: total,
+    breakdown: {
+      paperCost: Math.round(paperCost * 100) / 100,
+      inkCost: Math.round(inkCost * 100) / 100,
+      laminationCost: Math.round(laminationCost * 100) / 100,
+      bindingCost,
+      urgentSurcharge: Math.round(urgentSurcharge * 100) / 100,
+      subtotal: Math.round(subtotal * 100) / 100,
+      gst,
+      total,
+    },
+  });
+  res.json(responseData);
+});
+
+export default router;
