@@ -1,0 +1,86 @@
+import { Router } from "express";
+import { eq, desc } from "drizzle-orm";
+import { db, queueItemsTable, documentsTable, ordersTable } from "@workspace/db";
+import {
+  GetQueueResponse,
+  UpdateQueueItemStatusParams,
+  UpdateQueueItemStatusBody,
+  UpdateQueueItemStatusResponse,
+} from "@workspace/api-zod";
+
+const router = Router();
+
+/** GET /shop/queue */
+router.get("/shop/queue", async (req, res): Promise<void> => {
+  const items = await db.select().from(queueItemsTable)
+    .where(eq(queueItemsTable.status, "queued"))
+    .orderBy(desc(queueItemsTable.createdAt))
+    .limit(50);
+
+  const responseData = GetQueueResponse.parse(items.map(item => ({
+    id: item.id,
+    orderId: item.orderId,
+    anonymousId: item.anonymousId,
+    printType: item.printType,
+    pageCount: item.pageCount,
+    copies: item.copies,
+    totalAmount: item.totalAmount,
+    status: item.status,
+    expiresAt: item.expiresAt,
+    createdAt: item.createdAt,
+  })));
+  res.json(responseData);
+});
+
+/** PATCH /shop/queue/:id/status */
+router.patch("/shop/queue/:id/status", async (req, res): Promise<void> => {
+  const rawId = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
+  const params = UpdateQueueItemStatusParams.safeParse({ id: rawId });
+  const body = UpdateQueueItemStatusBody.safeParse(req.body);
+  if (!params.success || !body.success) {
+    res.status(400).json({ error: "Invalid request" });
+    return;
+  }
+
+  const [updated] = await db.update(queueItemsTable).set({
+    status: body.data.status as "printing" | "printed" | "failed",
+    updatedAt: new Date(),
+  }).where(eq(queueItemsTable.id, params.data.id)).returning();
+
+  if (!updated) {
+    res.status(404).json({ error: "Queue item not found" });
+    return;
+  }
+
+  // Auto-delete document after printing
+  if (body.data.status === "printed") {
+    const orders = await db.select().from(ordersTable).where(eq(ordersTable.id, updated.orderId)).limit(1);
+    if (orders[0]) {
+      await db.update(documentsTable).set({
+        status: "printed",
+        deletedAt: new Date(),
+      }).where(eq(documentsTable.id, orders[0].documentId));
+
+      await db.update(ordersTable).set({
+        status: "completed",
+        completedAt: new Date(),
+      }).where(eq(ordersTable.id, updated.orderId));
+    }
+  }
+
+  const responseData = UpdateQueueItemStatusResponse.parse({
+    id: updated.id,
+    orderId: updated.orderId,
+    anonymousId: updated.anonymousId,
+    printType: updated.printType,
+    pageCount: updated.pageCount,
+    copies: updated.copies,
+    totalAmount: updated.totalAmount,
+    status: updated.status,
+    expiresAt: updated.expiresAt,
+    createdAt: updated.createdAt,
+  });
+  res.json(responseData);
+});
+
+export default router;
