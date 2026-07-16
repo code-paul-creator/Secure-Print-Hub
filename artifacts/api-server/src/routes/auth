@@ -1,0 +1,148 @@
+import { Router } from "express";
+import { eq } from "drizzle-orm";
+import { db, usersTable } from "@workspace/db";
+import {
+  LoginBody,
+  VerifyOtpBody,
+  VerifyOtpResponse,
+  GetMeResponse,
+  LogoutResponse,
+} from "@workspace/api-zod";
+import { createHash, randomInt } from "crypto";
+
+const router = Router();
+
+// Simple in-memory session store (production: use Redis/DB)
+const sessions = new Map<string, string>(); // token -> userId
+
+function generateToken(): string {
+  return `sp_${randomInt(100000000, 999999999).toString(36)}_${Date.now().toString(36)}`;
+}
+
+function generateOtp(): string {
+  return randomInt(100000, 999999).toString();
+}
+
+function hashOtp(otp: string): string {
+  return createHash("sha256").update(otp + process.env.SESSION_SECRET).digest("hex");
+}
+
+/** POST /auth/login */
+router.post("/auth/login", async (req, res): Promise<void> => {
+  const parsed = LoginBody.safeParse(req.body);
+  if (!parsed.success) {
+    res.status(400).json({ error: parsed.error.message });
+    return;
+  }
+
+  const { email } = parsed.data;
+
+  // Upsert user
+  const existing = await db.select().from(usersTable).where(eq(usersTable.email, email)).limit(1);
+  const otp = generateOtp();
+  const otpHash = hashOtp(otp);
+  const otpExpiresAt = new Date(Date.now() + 10 * 60 * 1000); // 10 min
+
+  if (existing.length === 0) {
+    await db.insert(usersTable).values({ email, otpHash, otpExpiresAt });
+  } else {
+    await db.update(usersTable).set({ otpHash, otpExpiresAt }).where(eq(usersTable.email, email));
+  }
+
+  // In production: send OTP via email/SMS. For dev: log it.
+  req.log.info({ email, otp }, "OTP generated (dev mode)");
+
+  res.json({ message: `OTP sent to ${email}. (Dev: ${otp})`, expiresIn: 600 });
+});
+
+/** POST /auth/verify-otp */
+router.post("/auth/verify-otp", async (req, res): Promise<void> => {
+  const parsed = VerifyOtpBody.safeParse(req.body);
+  if (!parsed.success) {
+    res.status(400).json({ error: parsed.error.message });
+    return;
+  }
+
+  const { email, otp } = parsed.data;
+  const otpHash = hashOtp(otp);
+
+  const users = await db.select().from(usersTable).where(eq(usersTable.email, email)).limit(1);
+  if (!users.length) {
+    res.status(401).json({ error: "Invalid credentials" });
+    return;
+  }
+
+  const user = users[0];
+  if (user.otpHash !== otpHash || !user.otpExpiresAt || user.otpExpiresAt < new Date()) {
+    res.status(401).json({ error: "Invalid or expired OTP" });
+    return;
+  }
+
+  // Clear OTP and issue session
+  await db.update(usersTable).set({ otpHash: null, otpExpiresAt: null }).where(eq(usersTable.id, user.id));
+
+  const token = generateToken();
+  sessions.set(token, user.id);
+
+  res.cookie("session_token", token, {
+    httpOnly: true,
+    sameSite: "lax",
+    maxAge: 7 * 24 * 60 * 60 * 1000,
+  });
+
+  const responseData = VerifyOtpResponse.parse({
+    id: user.id,
+    email: user.email,
+    name: user.name,
+    phone: user.phone,
+    role: user.role,
+    shopId: user.shopId,
+    createdAt: user.createdAt,
+  });
+  res.json(responseData);
+});
+
+/** GET /auth/me */
+router.get("/auth/me", async (req, res): Promise<void> => {
+  const token = req.cookies?.session_token || req.headers.authorization?.replace("Bearer ", "");
+  if (!token) {
+    res.status(401).json({ error: "Unauthorized" });
+    return;
+  }
+
+  const userId = sessions.get(token);
+  if (!userId) {
+    res.status(401).json({ error: "Invalid session" });
+    return;
+  }
+
+  const users = await db.select().from(usersTable).where(eq(usersTable.id, userId)).limit(1);
+  if (!users.length) {
+    res.status(401).json({ error: "User not found" });
+    return;
+  }
+
+  const user = users[0];
+  const responseData = GetMeResponse.parse({
+    id: user.id,
+    email: user.email,
+    name: user.name,
+    phone: user.phone,
+    role: user.role,
+    shopId: user.shopId,
+    createdAt: user.createdAt,
+  });
+  res.json(responseData);
+});
+
+/** POST /auth/logout */
+router.post("/auth/logout", async (req, res): Promise<void> => {
+  const token = req.cookies?.session_token || req.headers.authorization?.replace("Bearer ", "");
+  if (token) sessions.delete(token);
+  res.clearCookie("session_token");
+  const responseData = LogoutResponse.parse({ message: "Logged out successfully" });
+  res.json(responseData);
+});
+
+export { sessions };
+export default router;
