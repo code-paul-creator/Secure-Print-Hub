@@ -1,0 +1,124 @@
+import { Router } from "express";
+import { eq, desc, sql } from "drizzle-orm";
+import { db, shopsTable, usersTable, ordersTable, documentsTable, auditLogsTable } from "@workspace/db";
+import {
+  AdminListShopsResponse,
+  AdminApproveShopParams,
+  AdminApproveShopBody,
+  AdminApproveShopResponse,
+  GetAdminStatsResponse,
+  AdminListUsersResponse,
+  GetAuditLogsResponse,
+} from "@workspace/api-zod";
+
+const router = Router();
+
+function mapShop(shop: typeof shopsTable.$inferSelect) {
+  return {
+    id: shop.id,
+    name: shop.name,
+    address: shop.address,
+    city: shop.city,
+    state: shop.state,
+    pincode: shop.pincode,
+    phone: shop.phone,
+    lat: shop.lat,
+    lng: shop.lng,
+    operatingHours: shop.operatingHours,
+    isOpen: shop.isOpen === "true",
+    status: shop.status,
+    rating: shop.rating,
+    totalOrders: shop.totalOrders,
+    distanceKm: null,
+    createdAt: shop.createdAt,
+  };
+}
+
+/** GET /admin/shops */
+router.get("/admin/shops", async (req, res): Promise<void> => {
+  const shops = await db.select().from(shopsTable).orderBy(desc(shopsTable.createdAt)).limit(100);
+  const responseData = AdminListShopsResponse.parse(shops.map(mapShop));
+  res.json(responseData);
+});
+
+/** PATCH /admin/shops/:id/approve */
+router.patch("/admin/shops/:id/approve", async (req, res): Promise<void> => {
+  const rawId = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
+  const params = AdminApproveShopParams.safeParse({ id: rawId });
+  const body = AdminApproveShopBody.safeParse(req.body);
+  if (!params.success || !body.success) {
+    res.status(400).json({ error: "Invalid request" });
+    return;
+  }
+
+  const newStatus = body.data.approved ? "approved" : "suspended";
+
+  const [updated] = await db.update(shopsTable).set({
+    status: newStatus,
+    updatedAt: new Date(),
+  }).where(eq(shopsTable.id, params.data.id)).returning();
+
+  if (!updated) {
+    res.status(404).json({ error: "Shop not found" });
+    return;
+  }
+
+  const responseData = AdminApproveShopResponse.parse(mapShop(updated));
+  res.json(responseData);
+});
+
+/** GET /admin/stats */
+router.get("/admin/stats", async (req, res): Promise<void> => {
+  const [shopCount] = await db.select({ count: sql<number>`count(*)` }).from(shopsTable);
+  const [userCount] = await db.select({ count: sql<number>`count(*)` }).from(usersTable);
+  const [orderStats] = await db.select({
+    count: sql<number>`count(*)`,
+    revenue: sql<number>`coalesce(sum(total_amount), 0)`,
+  }).from(ordersTable);
+  const [pendingApprovals] = await db.select({ count: sql<number>`count(*)` }).from(shopsTable).where(eq(shopsTable.status, "pending"));
+  const [deletedDocs] = await db.select({ count: sql<number>`count(*)` }).from(documentsTable).where(eq(documentsTable.status, "deleted"));
+
+  const responseData = GetAdminStatsResponse.parse({
+    totalShops: Number(shopCount?.count ?? 0),
+    totalUsers: Number(userCount?.count ?? 0),
+    totalOrders: Number(orderStats?.count ?? 0),
+    totalRevenue: Number(orderStats?.revenue ?? 0),
+    pendingApprovals: Number(pendingApprovals?.count ?? 0),
+    documentsDeleted: Number(deletedDocs?.count ?? 0),
+    activeSubscriptions: 0,
+  });
+  res.json(responseData);
+});
+
+/** GET /admin/users */
+router.get("/admin/users", async (req, res): Promise<void> => {
+  const users = await db.select().from(usersTable).orderBy(desc(usersTable.createdAt)).limit(100);
+  const responseData = AdminListUsersResponse.parse(users.map(u => ({
+    id: u.id,
+    email: u.email,
+    name: u.name,
+    phone: u.phone,
+    role: u.role,
+    shopId: u.shopId,
+    createdAt: u.createdAt,
+  })));
+  res.json(responseData);
+});
+
+/** GET /admin/audit-logs */
+router.get("/admin/audit-logs", async (req, res): Promise<void> => {
+  const logs = await db.select().from(auditLogsTable).orderBy(desc(auditLogsTable.createdAt)).limit(100);
+  const responseData = GetAuditLogsResponse.parse(logs.map(l => ({
+    id: l.id,
+    userId: l.userId,
+    action: l.action,
+    entityType: l.entityType,
+    entityId: l.entityId,
+    ipAddress: l.ipAddress,
+    metadata: l.metadata,
+    createdAt: l.createdAt,
+  })));
+  res.json(responseData);
+});
+
+export default router;
